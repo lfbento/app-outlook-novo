@@ -1,0 +1,18 @@
+# 1. Copiar do Windows para o Ubuntu (exemplo com scp)
+scp -r C:\bento\prg\app-outlook\* usuario@ubuntu:~/app-outlook/
+
+# 2. No Ubuntu, rodar o setup
+cd ~/app-outlook
+chmod +x setup_ubuntu.sh
+./setup_ubuntu.sh
+
+# 3. Editar .env com suas chaves
+nano pipeline/.env
+
+# 4. Iniciar Neo4j
+cd pipeline
+docker compose up -d
+
+# 5. Aguardar ~2min e testar
+source ../venv/bin/activate
+python pipeline/neo4j_loader_http_v1.py

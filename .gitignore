@@ -1,0 +1,45 @@
+# Secrets and environment variables
+.env
+*.env
+.env.*
+
+# Python Virtual Environments
+pst_venv/
+mineru_venv/
+venv/
+.venv/
+env/
+ENV/
+
+# Rust build output
+target/
+**/target/
+
+# Database data & heavy local storage
+pipeline/data/
+**/data/db/
+**/data/neo4j/
+**/data/extractions/
+**/data/obsidian*/
+
+# Python byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs & database files
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Agent state & IDE settings
+.agents/
+.idea/
+.vscode/
+.DS_Store
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
