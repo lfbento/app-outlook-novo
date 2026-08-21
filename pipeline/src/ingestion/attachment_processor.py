@@ -172,24 +172,29 @@ class AttachmentProcessor:
             return f"[Anexo {name}: Erro fatal na extração]"
 
     # ── Docling (modelo cacheado, GPU) ─────────────────────────────
+    _DOCLING_TIMEOUT = 120  # segundos
+
     @classmethod
     def _process_docling_with_fallback(cls, temp_path: str, name: str) -> str:
-        """Docling com modelo cacheado. Fallback: MarkItDown."""
-        # Guarda de tamanho: PDFs muito grandes (databooks escaneados) travam/OOM
-        # a GTX 1080 (8GB) no TableFormer. Roteia direto para MarkItDown.
+        """Docling com modelo cacheado e timeout. Fallback: MarkItDown."""
         if temp_path and os.path.exists(temp_path):
             size_mb = os.path.getsize(temp_path) / (1024 * 1024)
             if size_mb > 10.0:
                 logger.warning(
-                    f"Anexo {name} ({size_mb:.1f}MB) excede 10MB — usando MarkItDown (sem Docling/GPU)."
+                    f"Anexo {name} ({size_mb:.1f}MB) excede 10MB — usando MarkItDown."
                 )
                 return cls._process_markitdown(temp_path, name)
 
         try:
+            from concurrent.futures import ThreadPoolExecutor
             converter = _get_docling_converter()
-            result = converter.convert(temp_path)
-            md_text = result.document.export_to_markdown()
-            return md_text
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(converter.convert, temp_path)
+                result = future.result(timeout=cls._DOCLING_TIMEOUT)
+            return result.document.export_to_markdown()
+        except TimeoutError:
+            logger.warning(f"Docling timeout ({cls._DOCLING_TIMEOUT}s) em {name} — fallback.")
+            return cls._process_markitdown(temp_path, name)
         except Exception as e:
             logger.warning(f"Docling falhou em {name}: {e} — fallback MarkItDown.")
             return cls._process_markitdown(temp_path, name)
