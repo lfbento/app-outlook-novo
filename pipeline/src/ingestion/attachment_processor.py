@@ -237,6 +237,39 @@ class AttachmentProcessor:
             logger.error(f"Erro ao ler MS Project {name}: {e}")
             return f"[Anexo {name}: Erro na leitura do cronograma - {e}]"
 
+    # ── OCR (EasyOCR, modelo cacheado, GPU) ────────────────────────
+    _TINY_IMAGE_BYTES = 10 * 1024      # 10KB
+    _TINY_IMAGE_DIM = 50               # px
+
+    @classmethod
+    def _is_tiny_image(cls, temp_path: str) -> bool:
+        """Ícones/assinaturas/divisores não têm texto útil — pula OCR."""
+        try:
+            if os.path.getsize(temp_path) < cls._TINY_IMAGE_BYTES:
+                return True
+            from PIL import Image
+            with Image.open(temp_path) as im:
+                w, h = im.size
+            return w < cls._TINY_IMAGE_DIM and h < cls._TINY_IMAGE_DIM
+        except Exception:
+            return False
+
+    @classmethod
+    def _process_ocr(cls, temp_path: str, name: str) -> str:
+        """OCR de imagem com modelo cacheado. Fallback: MarkItDown."""
+        if cls._is_tiny_image(temp_path):
+            return ""
+        try:
+            reader = _get_easyocr_reader()
+            results = reader.readtext(temp_path, detail=0, paragraph=True)
+            text = "\n".join(results).strip()
+            if text:
+                return text
+            logger.warning(f"OCR vazio para {name}.")
+        except Exception as e:
+            logger.warning(f"OCR falhou para {name}: {e}")
+        return cls._process_markitdown(temp_path, name)
+
     # ── Callback para o Archive Extractor ──────────────────────────
     @classmethod
     def _process_internal_file(cls, internal_path: str, internal_name: str) -> str:
