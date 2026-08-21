@@ -1,4 +1,6 @@
-"""Driver batch: varre .msg, converte corpo+anexos para Markdown (GPU)."""
+"""Driver batch: varre .msg, converte corpo+anexos para Markdown (GPU).
+Usa max_workers=1 para evitar OOM: Docling(~2.5GB) + EasyOCR(~0.5GB) em cada
+worker com spawn causava 4×2.5GB > 8GB VRAM na GTX 1080. Serial é seguro."""
 import argparse
 import glob
 import logging
@@ -6,20 +8,16 @@ import os
 import sqlite3
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager
 
 import torch
 
-from config import EMAIL_SOURCE_DIR, MD_OUTPUT_DIR, PROGRESS_DB, USE_GPU
+from config import EMAIL_SOURCE_DIR, MD_OUTPUT_DIR, PROGRESS_DB
 from src.ingestion.msg_reader import read_msg
 from src.ingestion.attachment_processor import AttachmentProcessor
-from src.ingestion.format_router import get_engine, ConversionEngine
 from src.markdown.email_formatter import EmailFormatter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("convert_to_md")
-
-_GPU_LOCK = None
 
 
 def init_db():
@@ -47,25 +45,13 @@ def mark(msg_id: str, status: str):
         )
 
 
-def _init_worker(gpu_lock):
-    global _GPU_LOCK
-    _GPU_LOCK = gpu_lock
-
-
 def _convert_one(path: str) -> str:
     """Lê .msg + converte anexos (MarkItDown/Docling GPU/EasyOCR GPU)."""
     email = read_msg(path)
     texts = []
     for att in email["attachments"]:
-        name = att.get("name", "anexo.bin")
-        engine = get_engine(name)
         try:
-            if engine in (ConversionEngine.DOCLING, ConversionEngine.OCR):
-                # GPU: serializa para não estourar 8GB da GTX 1080
-                with _GPU_LOCK:
-                    texts.append(AttachmentProcessor.process(att))
-            else:
-                texts.append(AttachmentProcessor.process(att))
+            texts.append(AttachmentProcessor.process(att))
         except Exception as e:
             texts.append(f"[erro: {e}]")
     fmt = EmailFormatter(output_dir=MD_OUTPUT_DIR)
@@ -83,24 +69,14 @@ def main():
     logger.info("GPU disponível: %s", torch.cuda.is_available())
     files = sorted(glob.glob(os.path.join(args.source, "**", "*.msg"), recursive=True))
 
-    # retomada: pular já processados com sucesso (id = basename do arquivo)
     todo = [f for f in files if not is_done(os.path.basename(f))]
     if args.limit:
         todo = todo[: args.limit]
     logger.info("Total .msg: %d | a converter: %d", len(files), len(todo))
 
-    # CPU (MarkItDown/parsing) em paralelo; GPU (Docling/EasyOCR) serializada
-    # via _GPU_LOCK dentro de cada worker.
-    max_workers = max(1, min(4, (os.cpu_count() or 2) - 1))
-    manager = Manager()
-    gpu_lock = manager.Lock()
-
-    # "spawn": cada worker carrega seus próprios modelos GPU (evita CUDA+fork UB)
+    # max_workers=1: serial para não estourar 8GB VRAM (Docling+EasyOCR ~3GB/worker)
     ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(
-        max_workers=max_workers, mp_context=ctx,
-        initializer=_init_worker, initargs=(gpu_lock,)
-    ) as ex:
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
         futs = {ex.submit(_convert_one, f): f for f in todo}
         for i, fut in enumerate(as_completed(futs), 1):
             f = futs[fut]
