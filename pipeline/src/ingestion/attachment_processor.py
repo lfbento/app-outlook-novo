@@ -29,12 +29,26 @@ def _run_docling_process(temp_path: str, result_queue: multiprocessing.Queue):
     import gc
     try:
         import torch
-        from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            AcceleratorDevice,
+            AcceleratorOptions,
+            PdfPipelineOptions,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
 
-        converter = DocumentConverter()
+        pipeline_options = PdfPipelineOptions()
         if torch.cuda.is_available():
             # Acelera layout/TableFormer na GPU (GTX 1080)
-            converter.pipeline_options.device = torch.device("cuda")
+            pipeline_options.accelerator_options = AcceleratorOptions(
+                device=AcceleratorDevice.CUDA
+            )
+
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
 
         result = converter.convert(temp_path)
         md_text = result.document.export_to_markdown()
@@ -171,6 +185,15 @@ class AttachmentProcessor:
         Executa Docling em processo isolado (GPU quando disponível) para mitigar
         crashes pesados (std::bad_alloc). Fallback: MarkItDown.
         """
+        # Guarda de tamanho: PDFs muito grandes (databooks escaneados) travam/OOM
+        # a GTX 1080 (8GB) no TableFormer. Roteia direto para MarkItDown.
+        if temp_path and os.path.exists(temp_path):
+            size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            if size_mb > 10.0:
+                logger.warning(
+                    f"Anexo {name} ({size_mb:.1f}MB) excede 10MB — usando MarkItDown (sem Docling/GPU)."
+                )
+                return cls._process_markitdown(temp_path, name)
 
         logger.info(f"Iniciando Docling em processo isolado para {name}...")
         
