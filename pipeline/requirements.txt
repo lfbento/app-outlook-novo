@@ -1,46 +1,37 @@
-# CARACOL Pipeline - Python Dependencies
-# Windows / Linux
+# CARACOL Pipeline - Python Dependencies (Fase 1: .msg -> Markdown GPU)
 
 # Core
 python-dotenv>=1.0.0
 requests>=2.31.0
 urllib3>=2.0.0
 
-# Neo4j
-neo4j>=5.0.0
+# .msg parsing (OLE2) + HTML->Markdown
+extract-msg>=0.52.0
+markdownify>=0.14.0
 
-# LLM
-openai>=1.0.0
+# PDF + tabelas (GPU)
+docling>=2.20.0
+docling-ibm-models>=3.3.0
+accelerate>=1.0.0
+torch==2.7.1+cu118
+torchvision==0.22.1+cu118
 
-# Obsidian / Markdown
-python-frontmatter>=1.0.0
-pyyaml>=6.0
+# OCR (GPU)
+easyocr>=1.7.0
 
-# Data processing
-pydantic>=2.0.0
-
-# Vector store (optional)
-# chromadb>=0.4.0
-
-# Attachment parsing — Motor Padrão (rápido, leve)
+# Attachment parsing
 markitdown>=0.1.0
 
-# PDF conversion com alta fidelidade — Motor Docling (CPU-only)
-docling>=2.0.0
-# NOTA: PyTorch CPU-only — instalar separado:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# PDF text layer (rápido, sem GPU)
+pymupdf>=1.24.0
 
-# Arquivos compactados (ZIP nativo, TAR nativo)
+# Arquivos compactados
 py7zr>=0.20.0
 rarfile>=4.0
 
-# MS Project files (requer Java JRE 8+)
+# MS Project (opcional, requer Java JRE 8+)
 # mpxj>=13.0.0
 # jpype1>=1.5.0
 
-# LangGraph (only for query engine)
-langgraph>=0.0.1
-langchain-core>=0.1.0
-
-# RabbitMQ
-pika>=1.3.0
+# RabbitMQ (legado, não usado no driver batch direto)
+# pika>=1.3.0
