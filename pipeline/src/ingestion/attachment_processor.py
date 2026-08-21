@@ -1,11 +1,11 @@
 """
-Attachment Processor v3 — Estratégia híbrida MarkItDown + Docling + MinerU.
-Parte da evolução Fase 1 do Pipeline CARACOL.
+Attachment Processor v4 — Estratégia híbrida MarkItDown + Docling GPU + EasyOCR GPU.
+Parte da Fase 1 do Pipeline CARACOL (conversão .msg -> Markdown).
 
 Roteamento:
-- MarkItDown: MSG, DOCX, TXT, HTML, CSV, PPTX, XLSX (rápido)
-- Docling: PDF ≤3MB, Imagens (alta fidelidade: TableFormer AI + OCR)
-- MinerU: PDF >3MB (sliding-window, CPU-only, venv isolado)
+- MarkItDown: MSG, DOCX, TXT, HTML, CSV, PPTX, XLSX (rápido, CPU)
+- Docling: PDF (alta fidelidade: TableFormer + layout, GPU quando disponível)
+- EasyOCR: imagens PNG/JPG/TIFF/BMP (OCR, GPU quando disponível)
 - Archive Extractor: ZIP, RAR, 7Z, TAR (recursivo)
 - MS Project Reader: MPP, MPX (via MPXJ/Java)
 - Skip: DWG, EXE, DLL (binários sem texto)
@@ -25,24 +25,18 @@ from .format_router import get_engine, get_engine_name, ConversionEngine
 logger = logging.getLogger(__name__)
 
 def _run_docling_process(temp_path: str, result_queue: multiprocessing.Queue):
-    """Executado em um subprocesso para isolar possíveis crashes (std::bad_alloc) do C/C++ da biblioteca docling"""
+    """Executado em um subprocesso para isolar possíveis crashes (std::bad_alloc) do C/C++ da biblioteca docling."""
     import gc
     try:
+        import torch
         from docling.document_converter import DocumentConverter
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.document_converter import PdfFormatOption
-        
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = False
-        pipeline_options.generate_page_images = False
-        
-        docling = DocumentConverter(
-            format_options={
-                "pdf": PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
-        
-        result = docling.convert(temp_path)
+
+        converter = DocumentConverter()
+        if torch.cuda.is_available():
+            # Acelera layout/TableFormer na GPU (GTX 1080)
+            converter.pipeline_options.device = torch.device("cuda")
+
+        result = converter.convert(temp_path)
         md_text = result.document.export_to_markdown()
         result_queue.put(("success", md_text))
     except Exception as e:
@@ -60,60 +54,19 @@ def _run_markitdown_process(temp_path: str, result_queue: multiprocessing.Queue)
     except Exception as e:
         result_queue.put(("error", str(e)))
 
-# ── Caminho do executável MinerU (venv isolado) ────────────────────
-_PIPELINE_DIR = os.path.dirname(os.path.abspath(__file__))
-MINERU_EXE = os.path.join(
-    os.path.dirname(_PIPELINE_DIR),  # sobe de src/ingestion → src
-    os.pardir,                        # sobe de src → pipeline
-    "mineru_venv", "Scripts", "mineru.exe"
-)
-MINERU_EXE = os.path.normpath(MINERU_EXE)
 
-def _run_mineru_process(temp_path: str, result_queue: multiprocessing.Queue):
-    """
-    Chama MinerU via subprocess (venv dedicado) para isolar dependências.
-    Backend: pipeline (CPU-only, 86.2 OmniDocBench v1.5, sliding-window).
-    """
-    import shutil
-    out_dir = None
+def _run_easyocr_process(temp_path: str, result_queue: multiprocessing.Queue):
+    """OCR de imagem em subprocesso (EasyOCR GPU)."""
     try:
-        out_dir = tempfile.mkdtemp(prefix="mineru_")
-        result = subprocess.run(
-            [MINERU_EXE, "-p", temp_path, "-o", out_dir, "-b", "pipeline"],
-            capture_output=True, text=True, timeout=580, encoding="utf-8", errors="replace"
-        )
-        # MinerU gera subpastas com o nome do arquivo → procurar .md recursivamente
-        md_files = []
-        for root, dirs, files in os.walk(out_dir):
-            for f in files:
-                if f.endswith(".md"):
-                    md_files.append(os.path.join(root, f))
-        
-        if md_files:
-            # Concatenar todos os .md gerados (documentos multi-página geram múltiplos)
-            all_text = []
-            for md_file in sorted(md_files):
-                with open(md_file, "r", encoding="utf-8", errors="replace") as fh:
-                    all_text.append(fh.read())
-            result_queue.put(("success", "\n\n".join(all_text)))
-        else:
-            stderr_snippet = (result.stderr or "")[:500]
-            result_queue.put(("error", f"MinerU não gerou .md. stderr: {stderr_snippet}"))
-    except subprocess.TimeoutExpired:
-        result_queue.put(("error", "MinerU timeout (580s)"))
+        import torch
+        import easyocr
+        reader = easyocr.Reader(["pt", "en"], gpu=torch.cuda.is_available())
+        results = reader.readtext(temp_path, detail=0, paragraph=True)
+        result_queue.put(("success", "\n".join(results)))
     except Exception as e:
         result_queue.put(("error", str(e)))
-    finally:
-        if out_dir and os.path.exists(out_dir):
-            try:
-                shutil.rmtree(out_dir, ignore_errors=True)
-            except Exception:
-                pass
 
-from markitdown import MarkItDown
-from .format_router import get_engine, get_engine_name, ConversionEngine
 
-logger = logging.getLogger(__name__)
 
 class AttachmentProcessor:
     """
@@ -153,6 +106,8 @@ class AttachmentProcessor:
 
             if engine == ConversionEngine.DOCLING:
                 return cls._process_docling_with_fallback(temp_path, name)
+            elif engine == ConversionEngine.OCR:
+                return cls._process_ocr(temp_path, name)
             elif engine == ConversionEngine.ARCHIVE:
                 return cls._process_archive(temp_path, name)
             elif engine == ConversionEngine.MSPROJECT:
@@ -213,14 +168,9 @@ class AttachmentProcessor:
     @classmethod
     def _process_docling_with_fallback(cls, temp_path: str, name: str) -> str:
         """
-        Executa Docling em processo isolado para mitigar "std::bad_alloc" e outros crashes pesados.
-        Se falhar ou se o arquivo for > 3.0MB, cai direto para MarkItDown.
+        Executa Docling em processo isolado (GPU quando disponível) para mitigar
+        crashes pesados (std::bad_alloc). Fallback: MarkItDown.
         """
-        if temp_path and os.path.exists(temp_path):
-            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
-            if file_size_mb > 3.0:
-                logger.warning(f"Anexo {name} ({file_size_mb:.1f}MB) excede limite seguro p/ Docling (3MB). Roteando para MinerU (sliding-window)...")
-                return cls._process_mineru_with_fallback(temp_path, name)
 
         logger.info(f"Iniciando Docling em processo isolado para {name}...")
         
@@ -268,49 +218,32 @@ class AttachmentProcessor:
 
     @classmethod
     def _route_pdf_fallback(cls, temp_path: str, name: str) -> str:
-        """Roteia para MinerU se for PDF, senão usa MarkItDown."""
-        if name.lower().endswith('.pdf'):
-            logger.info(f"Recuperação: Roteando PDF {name} para o MinerU...")
-            return cls._process_mineru_with_fallback(temp_path, name)
+        """Fallback universal: MarkItDown."""
         return cls._process_markitdown(temp_path, name)
 
 
-    # ── MinerU (motor de alta fidelidade para PDFs grandes) ────────
+    # ── OCR (imagens, EasyOCR GPU) ─────────────────────────────────
     @classmethod
-    def _process_mineru_with_fallback(cls, temp_path: str, name: str) -> str:
-        """
-        Executa MinerU em subprocesso isolado (venv dedicado: mineru_venv).
-        Backend: pipeline (CPU-only, 86.2 OmniDocBench v1.5).
-        Fallback: MarkItDown se falhar ou timeout (10 min).
-        """
-        import queue as queue_module
-
-        if not os.path.exists(MINERU_EXE):
-            logger.warning(f"MinerU não instalado ({MINERU_EXE}). Usando MarkItDown como fallback para {name}.")
-            return cls._process_markitdown(temp_path, name)
-
-        logger.info(f"Iniciando MinerU para {name} (arquivo complexo/grande)...")
+    def _process_ocr(cls, temp_path: str, name: str) -> str:
+        """OCR de imagem em subprocesso isolado. Fallback: MarkItDown."""
+        logger.info(f"OCR (GPU) de {name} ...")
         try:
             ctx = multiprocessing.get_context("spawn")
             q = ctx.Queue()
-            p = ctx.Process(target=_run_mineru_process, args=(temp_path, q))
+            p = ctx.Process(target=_run_easyocr_process, args=(temp_path, q))
             p.start()
+            import queue
             try:
-                status, data = q.get(timeout=600)  # 10 min max
+                status, data = q.get(timeout=300)
                 p.join(timeout=10)
-
-                if status == "success":
-                    logger.info(f"MinerU processou {name} com sucesso ✅ ({len(data)} chars)")
+                if status == "success" and data.strip():
                     return data
-                else:
-                    logger.warning(f"MinerU falhou em {name}: {data} — usando MarkItDown...")
-            except queue_module.Empty:
-                logger.warning(f"MinerU timeout (10min) em {name} — matando processo e usando MarkItDown.")
+            except queue.Empty:
+                logger.warning(f"OCR timeout em {name} — matando processo.")
                 p.terminate()
                 p.join()
         except Exception as e:
-            logger.error(f"Erro ao iniciar MinerU para {name}: {e}")
-
+            logger.warning(f"OCR falhou para {name}: {e}")
         return cls._process_markitdown(temp_path, name)
 
     # ── Archive Extractor ──────────────────────────────────────────

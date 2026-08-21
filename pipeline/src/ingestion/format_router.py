@@ -9,7 +9,7 @@ from enum import Enum
 class ConversionEngine(Enum):
     MARKITDOWN = "markitdown"
     DOCLING = "docling"
-    MINERU = "mineru"          # Motor de alta fidelidade para PDFs complexos/grandes (>3MB)
+    OCR = "ocr"                # imagens (EasyOCR GPU)
     ARCHIVE = "archive"
     MSPROJECT = "msproject"
     SKIP = "skip"
@@ -37,14 +37,16 @@ ROUTING_TABLE = {
     '.xlsm': ConversionEngine.MARKITDOWN,
     '.xlsb': ConversionEngine.MARKITDOWN,
 
-    # Docling — alta fidelidade para PDFs e imagens (TableFormer + OCR)
+    # Docling — alta fidelidade para PDFs (TableFormer + OCR)
     '.pdf': ConversionEngine.DOCLING,
-    '.png': ConversionEngine.DOCLING,
-    '.jpg': ConversionEngine.DOCLING,
-    '.jpeg': ConversionEngine.DOCLING,
-    '.tiff': ConversionEngine.DOCLING,
-    '.tif': ConversionEngine.DOCLING,
-    '.bmp': ConversionEngine.DOCLING,
+
+    # OCR — imagens (EasyOCR GPU)
+    '.png': ConversionEngine.OCR,
+    '.jpg': ConversionEngine.OCR,
+    '.jpeg': ConversionEngine.OCR,
+    '.tiff': ConversionEngine.OCR,
+    '.tif': ConversionEngine.OCR,
+    '.bmp': ConversionEngine.OCR,
 
     # Arquivos compactados
     '.zip': ConversionEngine.ARCHIVE,
