@@ -10,6 +10,12 @@ logger = logging.getLogger(__name__)
 
 
 def _safe(value: Any) -> str:
+    if isinstance(value, bytes):
+        # htmlBody do extract-msg vem como bytes; decodifica UTF-8 (fallback latin-1)
+        try:
+            value = value.decode("utf-8")
+        except (UnicodeDecodeError, AttributeError):
+            value = value.decode("latin-1", errors="replace")
     return str(value or "")
 
 
@@ -18,7 +24,7 @@ def read_msg(path: str) -> Dict[str, Any]:
     with Message(path) as msg:
         subject = _safe(msg.subject) or "Sem Assunto"
         date = _safe(msg.date)
-        sender_email = _safe(msg.sender)
+        sender = _safe(msg.sender)
 
         attachments: List[Dict[str, Any]] = []
         for att in msg.attachments:
@@ -34,7 +40,7 @@ def read_msg(path: str) -> Dict[str, Any]:
         body_text = _safe(msg.body)
 
         # id estável (dedupe/retomada)
-        raw = f"{subject}_{date}_{sender_email}".encode("utf-8", errors="ignore")
+        raw = f"{subject}_{date}_{sender}".encode("utf-8", errors="ignore")
         msg_id = hashlib.md5(raw).hexdigest()
 
         account = os.path.basename(os.path.dirname(os.path.dirname(path)))
@@ -46,8 +52,8 @@ def read_msg(path: str) -> Dict[str, Any]:
         "account": account,
         "folder": folder,
         "subject": subject,
-        "sender": _safe(msg.sender),
-        "sender_email": sender_email,
+        "sender": sender,
+        "sender_email": sender,
         "to": _safe(msg.to),
         "cc": _safe(msg.cc),
         "date": date,
