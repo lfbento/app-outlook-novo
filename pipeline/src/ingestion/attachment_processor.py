@@ -1,33 +1,51 @@
 """
-Attachment Processor v4 — Estratégia híbrida MarkItDown + Docling GPU + EasyOCR GPU.
+Attachment Processor v5 — Estratégia híbrida MarkItDown + Docling GPU + EasyOCR GPU.
 Parte da Fase 1 do Pipeline CARACOL (conversão .msg -> Markdown).
 
 Roteamento:
-- MarkItDown: MSG, DOCX, TXT, HTML, CSV, PPTX, XLSX (rápido, CPU)
-- Docling: PDF (alta fidelidade: TableFormer + layout, GPU quando disponível)
-- EasyOCR: imagens PNG/JPG/TIFF/BMP (OCR, GPU quando disponível)
+- MarkItDown: MSG, DOCX, TXT, HTML, CSV, PPTX, XLSX (rápido, CPU, subprocesso isolado)
+- Docling: PDF (TableFormer + layout, GPU quando disponível) — modelo CACHEADO no worker
+- EasyOCR: imagens PNG/JPG/TIFF/BMP (OCR, GPU) — modelo CACHEADO no worker
 - Archive Extractor: ZIP, RAR, 7Z, TAR (recursivo)
 - MS Project Reader: MPP, MPX (via MPXJ/Java)
 - Skip: DWG, EXE, DLL (binários sem texto)
+
+Nota de performance: os modelos EasyOCR/Docling são carregados UMA VEZ por processo
+worker (lazy singleton) e reutilizados entre anexos. Recarregar por anexo custava ~3-5s
+de load por arquivo — com 7.8k anexos GPU-bound isso somava ~8 horas. O subprocesso
+isolado foi mantido apenas no MarkItDown, cujo risco de segfault em binário corrompido
+justifica o isolamento (e cuja contagem é baixa).
 """
 import os
 import gc
 import tempfile
 import logging
-import signal
 import multiprocessing
-import subprocess
-import traceback
 
 from markitdown import MarkItDown
 from .format_router import get_engine, get_engine_name, ConversionEngine
 
 logger = logging.getLogger(__name__)
 
-def _run_docling_process(temp_path: str, result_queue: multiprocessing.Queue):
-    """Executado em um subprocesso para isolar possíveis crashes (std::bad_alloc) do C/C++ da biblioteca docling."""
-    import gc
-    try:
+# ── Caches de modelo por processo (lazy singleton) ─────────────────
+_EASYOCR_READER = None
+_DOCLING_CONVERTER = None
+
+
+def _get_easyocr_reader():
+    """EasyOCR Reader pt+en, carregado uma vez por processo (GPU se disponível)."""
+    global _EASYOCR_READER
+    if _EASYOCR_READER is None:
+        import torch
+        import easyocr
+        _EASYOCR_READER = easyocr.Reader(["pt", "en"], gpu=torch.cuda.is_available())
+    return _EASYOCR_READER
+
+
+def _get_docling_converter():
+    """Docling DocumentConverter, carregado uma vez por processo (GPU se disponível)."""
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is None:
         import torch
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import (
@@ -39,24 +57,16 @@ def _run_docling_process(temp_path: str, result_queue: multiprocessing.Queue):
 
         pipeline_options = PdfPipelineOptions()
         if torch.cuda.is_available():
-            # Acelera layout/TableFormer na GPU (GTX 1080)
             pipeline_options.accelerator_options = AcceleratorOptions(
                 device=AcceleratorDevice.CUDA
             )
-
-        converter = DocumentConverter(
+        _DOCLING_CONVERTER = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
             }
         )
+    return _DOCLING_CONVERTER
 
-        result = converter.convert(temp_path)
-        md_text = result.document.export_to_markdown()
-        result_queue.put(("success", md_text))
-    except Exception as e:
-        result_queue.put(("error", str(e)))
-    finally:
-        gc.collect()
 
 def _run_markitdown_process(temp_path: str, result_queue: multiprocessing.Queue):
     """Executado em subprocesso para isolar segfaults do MarkItDown ao ler binários severamente corrompidos."""
@@ -69,23 +79,10 @@ def _run_markitdown_process(temp_path: str, result_queue: multiprocessing.Queue)
         result_queue.put(("error", str(e)))
 
 
-def _run_easyocr_process(temp_path: str, result_queue: multiprocessing.Queue):
-    """OCR de imagem em subprocesso (EasyOCR GPU)."""
-    try:
-        import torch
-        import easyocr
-        reader = easyocr.Reader(["pt", "en"], gpu=torch.cuda.is_available())
-        results = reader.readtext(temp_path, detail=0, paragraph=True)
-        result_queue.put(("success", "\n".join(results)))
-    except Exception as e:
-        result_queue.put(("error", str(e)))
-
-
-
 class AttachmentProcessor:
     """
     Fábrica que roteia cada anexo para o engine mais adequado.
-    Fallback automático: Docling falhar → MarkItDown → log de erro.
+    Fallback automático: Docling/OCR falhar → MarkItDown → log de erro.
     """
     _md = MarkItDown()          # Sempre carregado (leve, ~50MB)
 
@@ -116,8 +113,6 @@ class AttachmentProcessor:
                 f.write(data)
 
         try:
-            logger.info(f"Convertendo anexo: {name} [Motor: {engine_name}]")
-
             if engine == ConversionEngine.DOCLING:
                 return cls._process_docling_with_fallback(temp_path, name)
             elif engine == ConversionEngine.OCR:
@@ -136,55 +131,50 @@ class AttachmentProcessor:
             logger.error(f"Erro fatal ao processar anexo {name}: {e}")
             return f"[Erro ao processar anexo {name}: {e}]"
         finally:
-            if os.path.exists(temp_path):
+            if not file_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
                 except Exception:
                     pass
 
-    # ── MarkItDown (motor padrão) ──────────────────────────────────
+    # ── MarkItDown (motor padrão, subprocesso isolado) ─────────────
     @classmethod
     def _process_markitdown(cls, temp_path: str, name: str) -> str:
-        """Converte usando MarkItDown blindado em subprocesso — rápido, mas pode ter segfault nativo em arquivos corrompidos."""
-        logger.info(f"Processando {name} com MarkItDown em subprocesso isolado...")
+        """Converte via MarkItDown em subprocesso isolado (segfault em binário corrompido)."""
         try:
             ctx = multiprocessing.get_context("spawn")
             q = ctx.Queue()
             p = ctx.Process(target=_run_markitdown_process, args=(temp_path, q))
             p.start()
-            
+
             import queue
             try:
-                # O MarkItDown roda em segundos. O limite de 60s previne hangs infinitos em docx complexos
                 status, data = q.get(timeout=60)
                 p.join(timeout=5)
-                
+
                 if p.exitcode != 0 and status != "success":
                     logger.warning(f"MarkItDown crashou pesadamente (exitcode {p.exitcode}) em {name}!")
                     return f"[Anexo {name}: Erro Nativo Severo no MarkItDown]"
-                    
+
                 if status == "success":
                     return data
                 else:
                     return f"[Anexo {name}: Erro na extração - {data}]"
-                    
+
             except queue.Empty:
-                logger.warning(f"MarkItDown timeout excedido (60s) ou SegFault silencioso em {name} — matando processo.")
+                logger.warning(f"MarkItDown timeout (60s) em {name} — matando processo.")
                 p.terminate()
                 p.join()
                 return f"[Anexo {name}: Extração travou (Timeout/SegFault)]"
-                
+
         except Exception as e:
             logger.error(f"MarkItDown falha de subprocesso em {name}: {e}")
             return f"[Anexo {name}: Erro fatal na extração]"
 
-    # ── Docling com fallback (via multiprocessing) ─────────────────
+    # ── Docling (modelo cacheado, GPU) ─────────────────────────────
     @classmethod
     def _process_docling_with_fallback(cls, temp_path: str, name: str) -> str:
-        """
-        Executa Docling em processo isolado (GPU quando disponível) para mitigar
-        crashes pesados (std::bad_alloc). Fallback: MarkItDown.
-        """
+        """Docling com modelo cacheado. Fallback: MarkItDown."""
         # Guarda de tamanho: PDFs muito grandes (databooks escaneados) travam/OOM
         # a GTX 1080 (8GB) no TableFormer. Roteia direto para MarkItDown.
         if temp_path and os.path.exists(temp_path):
@@ -195,76 +185,26 @@ class AttachmentProcessor:
                 )
                 return cls._process_markitdown(temp_path, name)
 
-        logger.info(f"Iniciando Docling em processo isolado para {name}...")
-        
         try:
-            ctx = multiprocessing.get_context("spawn")
-            q = ctx.Queue()
-            p = ctx.Process(target=_run_docling_process, args=(temp_path, q))
-            p.start()
-            
-            import queue
-            try:
-                # O PULO DO GATO: Sempre leia da fila *antes* de fazer o join!
-                # Se o texto MarkDown for enorme, dar `.join()` antes de `.get()`
-                # enche o buffer OSI Pipe e mata os dois processos de deadlock!
-                status, data = q.get(timeout=120)
-                
-                # Agora sim, processo deve terminar suavemente em <10s
-                p.join(timeout=10)
-                
-                if p.exitcode != 0 and status != "success":
-                    logger.warning(f"Docling processo interrompido (exitcode {p.exitcode}) em {name}. Tentando recuperação...")
-                    return cls._route_pdf_fallback(temp_path, name)
-                    
-                if status == "success":
-                    logger.info(f"Docling processou {name} com sucesso ✅")
-                    return data
-                else:
-                    logger.warning(f"Docling falhou internamente em {name}: {data} — tentando recuperação...")
-                    return cls._route_pdf_fallback(temp_path, name)
-                    
-            except queue.Empty:
-                logger.warning(f"Docling timeout excedido (120s) em {name} — matando processo e tentando recuperação...")
-                p.terminate()
-                p.join()
-                return cls._route_pdf_fallback(temp_path, name)
-            except Exception as e:
-                logger.warning(f"Falha inter-processos com Docling para {name}: {e} — tentando recuperação...")
-                return cls._route_pdf_fallback(temp_path, name)
+            converter = _get_docling_converter()
+            result = converter.convert(temp_path)
+            md_text = result.document.export_to_markdown()
+            return md_text
+        except Exception as e:
+            logger.warning(f"Docling falhou em {name}: {e} — fallback MarkItDown.")
+            return cls._process_markitdown(temp_path, name)
 
-        except BaseException as root_e:
-            logger.error(f"Erro ao instanciar subprocesso do docling p/ {name}: {root_e}")
-
-        # Fallback se tudo der errado
-        return cls._route_pdf_fallback(temp_path, name)
-
-    @classmethod
-    def _route_pdf_fallback(cls, temp_path: str, name: str) -> str:
-        """Fallback universal: MarkItDown."""
-        return cls._process_markitdown(temp_path, name)
-
-
-    # ── OCR (imagens, EasyOCR GPU) ─────────────────────────────────
+    # ── OCR (EasyOCR, modelo cacheado, GPU) ────────────────────────
     @classmethod
     def _process_ocr(cls, temp_path: str, name: str) -> str:
-        """OCR de imagem em subprocesso isolado. Fallback: MarkItDown."""
-        logger.info(f"OCR (GPU) de {name} ...")
+        """OCR de imagem com modelo cacheado. Fallback: MarkItDown."""
         try:
-            ctx = multiprocessing.get_context("spawn")
-            q = ctx.Queue()
-            p = ctx.Process(target=_run_easyocr_process, args=(temp_path, q))
-            p.start()
-            import queue
-            try:
-                status, data = q.get(timeout=300)
-                p.join(timeout=10)
-                if status == "success" and data.strip():
-                    return data
-            except queue.Empty:
-                logger.warning(f"OCR timeout em {name} — matando processo.")
-                p.terminate()
-                p.join()
+            reader = _get_easyocr_reader()
+            results = reader.readtext(temp_path, detail=0, paragraph=True)
+            text = "\n".join(results).strip()
+            if text:
+                return text
+            logger.warning(f"OCR vazio para {name}.")
         except Exception as e:
             logger.warning(f"OCR falhou para {name}: {e}")
         return cls._process_markitdown(temp_path, name)
@@ -308,6 +248,8 @@ class AttachmentProcessor:
 
         if engine == ConversionEngine.DOCLING:
             return cls._process_docling_with_fallback(internal_path, internal_name)
+        elif engine == ConversionEngine.OCR:
+            return cls._process_ocr(internal_path, internal_name)
         elif engine == ConversionEngine.ARCHIVE:
             # Recursão: arquivo compactado dentro de arquivo compactado
             try:

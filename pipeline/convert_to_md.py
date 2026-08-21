@@ -4,8 +4,8 @@ import glob
 import logging
 import os
 import sqlite3
+import multiprocessing
 from multiprocessing import Manager
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 
@@ -94,8 +94,11 @@ def main():
     manager = Manager()
     gpu_lock = manager.Lock()
 
+    # "spawn": cada worker carrega seus próprios modelos GPU (evita CUDA+fork UB)
+    ctx = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(
-        max_workers=max_workers, initializer=_init_worker, initargs=(gpu_lock,)
+        max_workers=max_workers, mp_context=ctx,
+        initializer=_init_worker, initargs=(gpu_lock,)
     ) as ex:
         futs = {ex.submit(_convert_one, f): f for f in todo}
         for i, fut in enumerate(as_completed(futs), 1):
