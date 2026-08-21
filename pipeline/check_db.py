@@ -1,1 +1,0 @@
-﻿import sqlite3; c=sqlite3.connect('data/db/progress.sqlite').cursor(); c.execute('SELECT status, COUNT(*) FROM processed_emails GROUP BY status'); print('=== Status do SQLite ==='); [print(f'  {r[0]}: {r[1]}') for r in c.fetchall()]
