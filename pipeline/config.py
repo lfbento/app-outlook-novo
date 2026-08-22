@@ -14,7 +14,7 @@ PROJECT_DIR = os.path.dirname(PIPELINE_DIR)
 EMAIL_SOURCE_DIR = os.getenv("EMAIL_SOURCE_DIR", "/home/bento/transferencia/email")
 
 # Saída: markdown gerado
-MD_OUTPUT_DIR = os.getenv("MD_OUTPUT_DIR", os.path.join(PROJECT_DIR, "md-teste"))
+MD_OUTPUT_DIR = os.getenv("MD_OUTPUT_DIR", "/home/bento/obsidian_v2")
 
 # Retomada: SQLite de progresso
 PROGRESS_DB = os.getenv("PROGRESS_DB", os.path.join(PIPELINE_DIR, "data", "db", "md_progress.sqlite"))
