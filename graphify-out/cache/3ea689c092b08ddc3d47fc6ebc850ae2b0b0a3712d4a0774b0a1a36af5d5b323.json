@@ -1,0 +1,1 @@
+{"nodes": [], "edges": [{"source": "check_progress_py", "target": "processed_emails_table", "relation": "references", "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "pipeline/check_progress.py", "source_location": null, "weight": 1.0}], "hyperedges": []}

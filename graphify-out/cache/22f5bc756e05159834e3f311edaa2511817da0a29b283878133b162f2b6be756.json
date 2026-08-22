@@ -1,0 +1,1 @@
+{"nodes": [], "edges": [{"source": "pipeline_test_fase1_v2_py", "target": "format_router_get_engine", "relation": "calls", "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "pipeline/test_fase1_v2.py", "source_location": null, "weight": 1.0}], "hyperedges": []}
