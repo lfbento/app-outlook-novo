@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 def _safe(value: Any) -> str:
     if isinstance(value, bytes):
-        # htmlBody do extract-msg vem como bytes; decodifica UTF-8 (fallback latin-1)
         try:
             value = value.decode("utf-8")
         except (UnicodeDecodeError, AttributeError):
@@ -25,6 +24,10 @@ def read_msg(path: str) -> Dict[str, Any]:
         subject = _safe(msg.subject) or "Sem Assunto"
         date = _safe(msg.date)
         sender = _safe(msg.sender)
+        to = _safe(msg.to)
+        cc = _safe(msg.cc)
+        body_html = _safe(msg.htmlBody)
+        body_text = _safe(msg.body)
 
         attachments: List[Dict[str, Any]] = []
         for att in msg.attachments:
@@ -36,16 +39,13 @@ def read_msg(path: str) -> Dict[str, Any]:
             except Exception as e:
                 logger.warning("Falha ao ler anexo de %s: %s", path, e)
 
-        body_html = _safe(msg.htmlBody)
-        body_text = _safe(msg.body)
+    # id estável (dedupe/retomada)
+    raw = f"{subject}_{date}_{sender}".encode("utf-8", errors="ignore")
+    msg_id = hashlib.md5(raw).hexdigest()
 
-        # id estável (dedupe/retomada)
-        raw = f"{subject}_{date}_{sender}".encode("utf-8", errors="ignore")
-        msg_id = hashlib.md5(raw).hexdigest()
-
-        account = os.path.basename(os.path.dirname(os.path.dirname(path)))
-        folder = os.path.basename(os.path.dirname(path))
-        direction = "ENVIADO" if "Itens Enviados" in folder else "RECEBIDO"
+    account = os.path.basename(os.path.dirname(os.path.dirname(path)))
+    folder = os.path.basename(os.path.dirname(path))
+    direction = "ENVIADO" if "Itens Enviados" in folder else "RECEBIDO"
 
     return {
         "id": msg_id,
@@ -54,8 +54,8 @@ def read_msg(path: str) -> Dict[str, Any]:
         "subject": subject,
         "sender": sender,
         "sender_email": sender,
-        "to": _safe(msg.to),
-        "cc": _safe(msg.cc),
+        "to": to,
+        "cc": cc,
         "date": date,
         "direction": direction,
         "body_html": body_html,
